@@ -1049,7 +1049,14 @@
 
             async shareScreen() {
                 try {
-                    const screenStream = await navigator.mediaDevices.getDisplayMedia({ video: true });
+                    const screenStream = await navigator.mediaDevices.getDisplayMedia({ 
+                        video: {
+                            width: { ideal: 1920 },
+                            height: { ideal: 1080 },
+                            frameRate: { ideal: 60 }
+                        },
+                        audio: true
+                    });
                     const videoTrack = screenStream.getVideoTracks()[0];
                     
                     this.peerConnections.forEach(async (peerConnection) => {
