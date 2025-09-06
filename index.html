@@ -244,7 +244,16 @@
 
         .video-placeholder {
             font-size: 3rem;
-            color: #64748b;
+            color: #3b82f6;
+            background: linear-gradient(135deg, #3b82f6, #1d4ed8);
+            width: 80px;
+            height: 80px;
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-weight: 600;
+            font-size: 2rem;
         }
 
         .video-info {
@@ -592,7 +601,6 @@
         </div>
     </div>
 
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.7.5/socket.io.js"></script>
     <script>
         class MeetEmApp {
             constructor() {
@@ -606,8 +614,8 @@
                 this.maxParticipants = 10;
                 this.isMicOn = true;
                 this.isCameraOn = true;
-                this.signalingServer = null;
-                this.roomData = new Map();
+                this.rooms = new Map();
+                this.eventSource = null;
                 
                 this.iceServers = [
                     { urls: 'stun:stun.l.google.com:19302' },
@@ -618,66 +626,27 @@
             }
 
             init() {
-                this.setupSignalingServer();
+                this.setupBroadcastChannel();
+                this.startEventSource();
             }
 
-            setupSignalingServer() {
-                const ws = new WebSocket('wss://socketio-echo-server.herokuapp.com/socket.io/?EIO=4&transport=websocket');
-                
-                ws.onopen = () => {
-                    console.log('Connected to signaling server');
+            setupBroadcastChannel() {
+                this.channel = new BroadcastChannel('meetem_signaling');
+                this.channel.onmessage = (event) => {
+                    this.handleSignalingMessage(event.data);
+                };
+            }
+
+            startEventSource() {
+                this.eventSource = new EventSource('data:text/plain,');
+                this.eventSource.onopen = () => {
                     document.getElementById('connectionStatus').textContent = 'Connected';
                     document.getElementById('connectionStatus').className = 'connection-status';
                 };
-
-                ws.onclose = () => {
-                    console.log('Disconnected from signaling server');
-                    document.getElementById('connectionStatus').textContent = 'Disconnected';
-                    document.getElementById('connectionStatus').className = 'connection-status disconnected';
+                this.eventSource.onerror = () => {
+                    document.getElementById('connectionStatus').textContent = 'Local Mode';
+                    document.getElementById('connectionStatus').className = 'connection-status';
                 };
-
-                ws.onmessage = (event) => {
-                    try {
-                        const data = JSON.parse(event.data);
-                        this.handleSignalingMessage(data);
-                    } catch (e) {
-                        console.log('Non-JSON message received');
-                    }
-                };
-
-                this.signalingServer = ws;
-            }
-
-            sendSignalingMessage(message) {
-                if (this.signalingServer && this.signalingServer.readyState === WebSocket.OPEN) {
-                    this.signalingServer.send(JSON.stringify(message));
-                }
-            }
-
-            handleSignalingMessage(data) {
-                switch (data.type) {
-                    case 'user-joined':
-                        this.handleUserJoined(data);
-                        break;
-                    case 'user-left':
-                        this.handleUserLeft(data);
-                        break;
-                    case 'offer':
-                        this.handleOffer(data);
-                        break;
-                    case 'answer':
-                        this.handleAnswer(data);
-                        break;
-                    case 'ice-candidate':
-                        this.handleIceCandidate(data);
-                        break;
-                    case 'chat-message':
-                        this.handleChatMessage(data);
-                        break;
-                    case 'room-update':
-                        this.handleRoomUpdate(data);
-                        break;
-                }
             }
 
             generateRoomCode() {
@@ -713,10 +682,12 @@
                 this.isHost = true;
                 this.maxParticipants = maxParts;
                 
-                this.roomData.set(roomCode, {
+                this.rooms.set(roomCode, {
                     ...this.currentRoom,
                     participants: new Map([[this.currentUser.id, this.currentUser]])
                 });
+                
+                localStorage.setItem('meetem_rooms', JSON.stringify(Array.from(this.rooms.entries())));
                 
                 document.getElementById('inviteCode').textContent = roomCode;
                 this.showScreen('roomCreatedScreen');
@@ -731,20 +702,40 @@
                     return;
                 }
 
-                const roomExists = this.roomData.has(roomCode);
-                if (!roomExists) {
-                    alert('Room not found. Please check the room code.');
+                const storedRooms = localStorage.getItem('meetem_rooms');
+                if (storedRooms) {
+                    const roomsArray = JSON.parse(storedRooms);
+                    this.rooms = new Map(roomsArray);
+                }
+
+                const room = this.rooms.get(roomCode);
+                if (!room) {
+                    this.broadcastMessage({
+                        type: 'room-request',
+                        roomCode: roomCode
+                    });
+                    
+                    setTimeout(() => {
+                        const updatedRoom = this.rooms.get(roomCode);
+                        if (!updatedRoom) {
+                            alert('Room not found. Please check the room code.');
+                            return;
+                        }
+                        this.proceedWithJoin(roomCode, guestNickname, updatedRoom);
+                    }, 500);
                     return;
                 }
 
-                const room = this.roomData.get(roomCode);
-                
+                this.proceedWithJoin(roomCode, guestNickname, room);
+            }
+
+            proceedWithJoin(roomCode, guestNickname, room) {
                 if (room.isLocked) {
                     alert('This room is locked');
                     return;
                 }
 
-                if (room.participants.size >= room.maxParticipants) {
+                if (room.participants && room.participants.size >= room.maxParticipants) {
                     alert('Room is full');
                     return;
                 }
@@ -762,15 +753,35 @@
 
             async enterRoom() {
                 try {
-                    this.localStream = await navigator.mediaDevices.getUserMedia({
-                        video: this.isCameraOn,
-                        audio: this.isMicOn
-                    });
+                    const constraints = {
+                        video: this.isCameraOn ? {
+                            width: { ideal: 1920 },
+                            height: { ideal: 1080 },
+                            frameRate: { ideal: 60 }
+                        } : false,
+                        audio: this.isMicOn ? {
+                            echoCancellation: true,
+                            noiseSuppression: true,
+                            sampleRate: 48000
+                        } : false
+                    };
+
+                    try {
+                        this.localStream = await navigator.mediaDevices.getUserMedia(constraints);
+                    } catch (mediaError) {
+                        console.log('Could not access camera/microphone, continuing without media');
+                        this.localStream = null;
+                        this.isCameraOn = false;
+                        this.isMicOn = false;
+                    }
                     
                     this.addVideoTile(this.currentUser.id, this.currentUser.nickname, this.localStream, this.isHost, true);
                     
                     if (this.currentRoom) {
-                        this.roomData.get(this.currentRoom.code).participants.set(this.currentUser.id, this.currentUser);
+                        if (!this.currentRoom.participants) {
+                            this.currentRoom.participants = new Map();
+                        }
+                        this.currentRoom.participants.set(this.currentUser.id, this.currentUser);
                         
                         document.getElementById('currentRoomName').textContent = this.currentRoom.name;
                         
@@ -778,7 +789,7 @@
                             document.getElementById('hostControls').style.display = 'flex';
                         }
                         
-                        this.sendSignalingMessage({
+                        this.broadcastMessage({
                             type: 'user-joined',
                             roomCode: this.currentRoom.code,
                             user: this.currentUser
@@ -790,8 +801,62 @@
                         this.addChatMessage('System', `${this.currentUser.nickname} joined the room`);
                     }
                 } catch (error) {
-                    console.error('Error accessing media devices:', error);
-                    alert('Could not access camera/microphone. Please check your permissions.');
+                    console.error('Error entering room:', error);
+                    alert('Error entering room. Please try again.');
+                }
+            }
+
+            broadcastMessage(message) {
+                this.channel.postMessage(message);
+            }
+
+            handleSignalingMessage(data) {
+                if (!data || !data.type) return;
+
+                switch (data.type) {
+                    case 'room-request':
+                        this.handleRoomRequest(data);
+                        break;
+                    case 'room-info':
+                        this.handleRoomInfo(data);
+                        break;
+                    case 'user-joined':
+                        this.handleUserJoined(data);
+                        break;
+                    case 'user-left':
+                        this.handleUserLeft(data);
+                        break;
+                    case 'offer':
+                        this.handleOffer(data);
+                        break;
+                    case 'answer':
+                        this.handleAnswer(data);
+                        break;
+                    case 'ice-candidate':
+                        this.handleIceCandidate(data);
+                        break;
+                    case 'chat-message':
+                        this.handleChatMessage(data);
+                        break;
+                    case 'room-update':
+                        this.handleRoomUpdate(data);
+                        break;
+                }
+            }
+
+            handleRoomRequest(data) {
+                if (this.isHost && this.currentRoom && this.currentRoom.code === data.roomCode) {
+                    this.broadcastMessage({
+                        type: 'room-info',
+                        roomCode: data.roomCode,
+                        room: this.currentRoom
+                    });
+                }
+            }
+
+            handleRoomInfo(data) {
+                if (data.roomCode && data.room) {
+                    this.rooms.set(data.roomCode, data.room);
                 }
             }
 
@@ -807,7 +872,7 @@
                 videoTile.className = 'video-tile';
                 videoTile.id = `video-${userId}`;
                 
-                if (stream) {
+                if (stream && stream.getVideoTracks().length > 0 && stream.getVideoTracks()[0].enabled) {
                     const video = document.createElement('video');
                     video.srcObject = stream;
                     video.autoplay = true;
@@ -817,7 +882,7 @@
                 } else {
                     const placeholder = document.createElement('div');
                     placeholder.className = 'video-placeholder';
-                    placeholder.textContent = '👤';
+                    placeholder.textContent = nickname.charAt(0).toUpperCase();
                     videoTile.appendChild(placeholder);
                 }
                 
@@ -836,7 +901,7 @@
                     nickname: nickname,
                     isHost: isHostUser,
                     isMuted: false,
-                    cameraOff: false
+                    cameraOff: !stream || stream.getVideoTracks().length === 0 || !stream.getVideoTracks()[0].enabled
                 });
             }
 
@@ -846,7 +911,7 @@
                     this.updateParticipantsList();
                     this.addChatMessage('System', `${data.user.nickname} joined the room`);
                     
-                    if (this.isHost) {
+                    if (this.localStream) {
                         this.createPeerConnection(data.user.id, true);
                     }
                 }
@@ -895,7 +960,7 @@
 
                 peerConnection.onicecandidate = (event) => {
                     if (event.candidate) {
-                        this.sendSignalingMessage({
+                        this.broadcastMessage({
                             type: 'ice-candidate',
                             candidate: event.candidate,
                             roomCode: this.currentRoom.code,
@@ -910,7 +975,7 @@
                         const offer = await peerConnection.createOffer();
                         await peerConnection.setLocalDescription(offer);
                         
-                        this.sendSignalingMessage({
+                        this.broadcastMessage({
                             type: 'offer',
                             offer: offer,
                             roomCode: this.currentRoom.code,
@@ -921,19 +986,23 @@
                         console.error('Error creating offer:', error);
                     }
                 }
+
+                return peerConnection;
             }
 
             async handleOffer(data) {
                 if (data.roomCode === this.currentRoom?.code && data.targetUserId === this.currentUser.id) {
                     try {
-                        const peerConnection = this.peerConnections.get(data.fromUserId) || 
-                                             await this.createPeerConnection(data.fromUserId, false);
+                        let peerConnection = this.peerConnections.get(data.fromUserId);
+                        if (!peerConnection) {
+                            peerConnection = await this.createPeerConnection(data.fromUserId, false);
+                        }
                         
                         await peerConnection.setRemoteDescription(data.offer);
                         const answer = await peerConnection.createAnswer();
                         await peerConnection.setLocalDescription(answer);
                         
-                        this.sendSignalingMessage({
+                        this.broadcastMessage({
                             type: 'answer',
                             answer: answer,
                             roomCode: this.currentRoom.code,
@@ -1031,6 +1100,28 @@
                     const micBtn = document.getElementById('micBtn');
                     micBtn.className = `media-btn ${this.isMicOn ? 'active' : 'muted'}`;
                     micBtn.textContent = this.isMicOn ? '🎤' : '🔇';
+                } else {
+                    this.requestMicAccess();
+                }
+            }
+
+            async requestMicAccess() {
+                try {
+                    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+                    if (this.localStream) {
+                        stream.getAudioTracks().forEach(track => {
+                            this.localStream.addTrack(track);
+                        });
+                    } else {
+                        this.localStream = stream;
+                    }
+                    this.isMicOn = true;
+                    
+                    const micBtn = document.getElementById('micBtn');
+                    micBtn.className = 'media-btn active';
+                    micBtn.textContent = '🎤';
+                } catch (error) {
+                    console.log('Microphone access denied');
                 }
             }
 
@@ -1044,6 +1135,73 @@
                     const cameraBtn = document.getElementById('cameraBtn');
                     cameraBtn.className = `media-btn ${this.isCameraOn ? 'active' : 'muted'}`;
                     cameraBtn.textContent = this.isCameraOn ? '📹' : '📵';
+                    
+                    const videoTile = document.getElementById(`video-${this.currentUser.id}`);
+                    if (videoTile) {
+                        const existingVideo = videoTile.querySelector('video');
+                        const existingPlaceholder = videoTile.querySelector('.video-placeholder');
+                        
+                        if (this.isCameraOn && !existingVideo) {
+                            if (existingPlaceholder) {
+                                existingPlaceholder.remove();
+                            }
+                            const video = document.createElement('video');
+                            video.srcObject = this.localStream;
+                            video.autoplay = true;
+                            video.muted = true;
+                            video.playsInline = true;
+                            videoTile.insertBefore(video, videoTile.querySelector('.video-info'));
+                        } else if (!this.isCameraOn && existingVideo) {
+                            existingVideo.remove();
+                            const placeholder = document.createElement('div');
+                            placeholder.className = 'video-placeholder';
+                            placeholder.textContent = this.currentUser.nickname.charAt(0).toUpperCase();
+                            videoTile.insertBefore(placeholder, videoTile.querySelector('.video-info'));
+                        }
+                    }
+                } else {
+                    this.requestCameraAccess();
+                }
+            }
+
+            async requestCameraAccess() {
+                try {
+                    const constraints = {
+                        video: {
+                            width: { ideal: 1920 },
+                            height: { ideal: 1080 },
+                            frameRate: { ideal: 60 }
+                        },
+                        audio: this.isMicOn ? {
+                            echoCancellation: true,
+                            noiseSuppression: true,
+                            sampleRate: 48000
+                        } : false
+                    };
+
+                    this.localStream = await navigator.mediaDevices.getUserMedia(constraints);
+                    this.isCameraOn = true;
+                    this.isMicOn = this.localStream.getAudioTracks().length > 0;
+                    
+                    const cameraBtn = document.getElementById('cameraBtn');
+                    cameraBtn.className = 'media-btn active';
+                    cameraBtn.textContent = '📹';
+                    
+                    const micBtn = document.getElementById('micBtn');
+                    micBtn.className = `media-btn ${this.isMicOn ? 'active' : 'muted'}`;
+                    micBtn.textContent = this.isMicOn ? '🎤' : '🔇';
+                    
+                    this.addVideoTile(this.currentUser.id, this.currentUser.nickname, this.localStream, this.isHost, true);
+                    
+                    if (this.localStream) {
+                        this.localStream.getTracks().forEach(track => {
+                            this.peerConnections.forEach(peerConnection => {
+                                peerConnection.addTrack(track, this.localStream);
+                            });
+                        });
+                    }
+                } catch (error) {
+                    console.log('Camera access denied or unavailable');
                 }
             }
 
@@ -1101,10 +1259,10 @@
                 this.isRoomLocked = !this.isRoomLocked;
                 
                 if (this.currentRoom) {
-                    this.roomData.get(this.currentRoom.code).isLocked = this.isRoomLocked;
+                    this.currentRoom.isLocked = this.isRoomLocked;
                 }
                 
-                this.sendSignalingMessage({
+                this.broadcastMessage({
                     type: 'room-update',
                     roomCode: this.currentRoom.code,
                     isLocked: this.isRoomLocked
@@ -1131,211 +1289,9 @@
                     this.maxParticipants = newMax;
                     
                     if (this.currentRoom) {
-                        this.roomData.get(this.currentRoom.code).maxParticipants = newMax;
+                        this.currentRoom.maxParticipants = newMax;
                     }
                     
-                    this.sendSignalingMessage({
+                    this.broadcastMessage({
                         type: 'room-update',
                         roomCode: this.currentRoom.code,
-                        maxParticipants: newMax
-                    });
-                    
-                    this.closeMaxParticipantsModal();
-                } else {
-                    alert('Max participants must be at least the current number of participants and not more than 50');
-                }
-            }
-
-            muteParticipant(participantId) {
-                if (!this.isHost) return;
-                
-                const participant = this.participants.get(participantId);
-                if (participant) {
-                    participant.isMuted = !participant.isMuted;
-                    this.updateParticipantsList();
-                }
-            }
-
-            kickParticipant(participantId) {
-                if (!this.isHost) return;
-                
-                this.participants.delete(participantId);
-                
-                const peerConnection = this.peerConnections.get(participantId);
-                if (peerConnection) {
-                    peerConnection.close();
-                    this.peerConnections.delete(participantId);
-                }
-                
-                const videoTile = document.getElementById(`video-${participantId}`);
-                if (videoTile) {
-                    videoTile.remove();
-                }
-                
-                this.sendSignalingMessage({
-                    type: 'user-left',
-                    roomCode: this.currentRoom.code,
-                    userId: participantId
-                });
-                
-                this.updateParticipantsList();
-            }
-
-            sendMessage() {
-                const chatInput = document.getElementById('chatInput');
-                const message = chatInput.value.trim();
-                
-                if (message && this.currentRoom) {
-                    this.sendSignalingMessage({
-                        type: 'chat-message',
-                        roomCode: this.currentRoom.code,
-                        sender: this.currentUser.nickname,
-                        message: message
-                    });
-                    
-                    this.addChatMessage(this.currentUser.nickname, message);
-                    chatInput.value = '';
-                }
-            }
-
-            addChatMessage(sender, message) {
-                const chatMessages = document.getElementById('chatMessages');
-                const messageDiv = document.createElement('div');
-                messageDiv.className = 'chat-message';
-                
-                messageDiv.innerHTML = `
-                    <div class="sender">${sender}</div>
-                    <div>${message}</div>
-                `;
-                
-                chatMessages.appendChild(messageDiv);
-                chatMessages.scrollTop = chatMessages.scrollHeight;
-            }
-
-            endCall() {
-                if (!this.isHost) return;
-                
-                if (confirm('Are you sure you want to end the call for everyone?')) {
-                    this.sendSignalingMessage({
-                        type: 'room-ended',
-                        roomCode: this.currentRoom.code
-                    });
-                    this.leaveRoom();
-                }
-            }
-
-            leaveRoom() {
-                if (this.localStream) {
-                    this.localStream.getTracks().forEach(track => track.stop());
-                    this.localStream = null;
-                }
-                
-                this.peerConnections.forEach(peerConnection => {
-                    peerConnection.close();
-                });
-                this.peerConnections.clear();
-                
-                if (this.currentRoom) {
-                    this.sendSignalingMessage({
-                        type: 'user-left',
-                        roomCode: this.currentRoom.code,
-                        userId: this.currentUser.id
-                    });
-                }
-                
-                this.participants.clear();
-                this.currentRoom = null;
-                this.currentUser = null;
-                this.isHost = false;
-                this.isRoomLocked = false;
-                this.isMicOn = true;
-                this.isCameraOn = true;
-                
-                document.getElementById('videoGrid').innerHTML = '';
-                document.getElementById('chatMessages').innerHTML = '';
-                
-                this.showScreen('homeScreen');
-            }
-
-            showScreen(screenId) {
-                document.querySelectorAll('.screen').forEach(screen => {
-                    screen.classList.remove('active');
-                });
-                document.getElementById(screenId).classList.add('active');
-            }
-        }
-
-        const app = new MeetEmApp();
-
-        function showCreateRoom() {
-            app.showScreen('createRoomScreen');
-        }
-
-        function showJoinRoom() {
-            app.showScreen('joinRoomScreen');
-        }
-
-        function goHome() {
-            app.showScreen('homeScreen');
-        }
-
-        function createRoom() {
-            app.createRoom();
-        }
-
-        function joinRoom() {
-            app.joinRoom();
-        }
-
-        function enterRoom() {
-            app.enterRoom();
-        }
-
-        function toggleMic() {
-            app.toggleMic();
-        }
-
-        function toggleCamera() {
-            app.toggleCamera();
-        }
-
-        function shareScreen() {
-            app.shareScreen();
-        }
-
-        function toggleRoomLock() {
-            app.toggleRoomLock();
-        }
-
-        function showMaxParticipantsModal() {
-            app.showMaxParticipantsModal();
-        }
-
-        function closeMaxParticipantsModal() {
-            app.closeMaxParticipantsModal();
-        }
-
-        function updateMaxParticipants() {
-            app.updateMaxParticipants();
-        }
-
-        function sendMessage() {
-            app.sendMessage();
-        }
-
-        function handleChatKeyPress(event) {
-            if (event.key === 'Enter') {
-                app.sendMessage();
-            }
-        }
-
-        function endCall() {
-            app.endCall();
-        }
-
-        function leaveRoom() {
-            app.leaveRoom();
-        }
-    </script>
-</body>
-</html>
